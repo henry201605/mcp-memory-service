@@ -1,0 +1,17 @@
+# Memory MCP 自定义镜像（v4）
+# 基础镜像：doobidoo/mcp-memory-service（SQLite-vec + ONNX embedding）
+# 变更：从 27b-io（Qdrant）迁移到 doobidoo（SQLite-vec），修复 prompt_name bug
+#
+# 构建命令：
+#   docker build -f Dockerfile.memory-mcp -t unipus.tencentcloudcr.com/unipus/mcp/memory-mcp:v4 .
+#   docker push unipus.tencentcloudcr.com/unipus/mcp/memory-mcp:v4
+
+FROM doobidoo/mcp-memory-service:latest
+
+# 通过国内镜像预下载 embedding 模型（~90MB），避免运行时下载超时
+ENV HF_ENDPOINT=https://hf-mirror.com
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+ENV HF_ENDPOINT=
+
+# 创建数据目录
+RUN mkdir -p /app/data/backups
