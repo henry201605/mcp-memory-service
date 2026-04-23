@@ -18,6 +18,7 @@ Sync management endpoints for hybrid backend.
 Provides status monitoring and manual sync triggering for hybrid storage mode.
 """
 
+import time
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -40,12 +41,13 @@ class SyncStatusResponse(BaseModel):
     is_paused: bool
     last_sync_time: float
     operations_pending: int
-    operations_processed: int
-    operations_failed: int
+    operations_processed: int  # lifetime success count
+    operations_failed: int  # lifetime failure count (does not indicate current health)
+    consecutive_failures: int = 0  # resets on any success — use this for current health
     sync_interval_seconds: int
     time_since_last_sync_seconds: float
     next_sync_eta_seconds: float
-    status: str  # 'synced', 'syncing', 'pending', 'error'
+    status: str  # 'synced', 'syncing', 'pending', 'error' — reflects current health only
 
 
 class SyncForceResponse(BaseModel):
@@ -90,7 +92,6 @@ async def get_sync_status(
         sync_status = await storage.get_sync_status()
 
         # Calculate time since last sync
-        import time
         current_time = time.time()
         last_sync = sync_status.get('last_sync_time', 0)
         time_since_sync = current_time - last_sync if last_sync > 0 else 0
@@ -99,16 +100,19 @@ async def get_sync_status(
         sync_interval = sync_status.get('sync_interval', 300)
         next_sync_eta = max(0, sync_interval - time_since_sync)
 
-        # Determine status
+        # Determine status — reflects CURRENT health only. Lifetime `operations_failed`
+        # is not used here because a single historical failure would then pin `status`
+        # to 'error' forever, masking real-time sync health (see issue #750).
         is_running = sync_status.get('is_running', False)
         pending_ops = sync_status.get('pending_operations', 0)
         actively_syncing = sync_status.get('actively_syncing', False)  # True only during active sync
+        consecutive_failures = sync_status.get('consecutive_failures', 0)
 
         if actively_syncing:
             status = 'syncing'
         elif pending_ops > 0:
             status = 'pending'
-        elif sync_status.get('operations_failed', 0) > 0:
+        elif consecutive_failures > 0:
             status = 'error'
         else:
             status = 'synced'
@@ -121,6 +125,7 @@ async def get_sync_status(
             operations_pending=pending_ops,
             operations_processed=sync_status.get('operations_processed', 0),
             operations_failed=sync_status.get('operations_failed', 0),
+            consecutive_failures=consecutive_failures,
             sync_interval_seconds=sync_interval,
             time_since_last_sync_seconds=time_since_sync,
             next_sync_eta_seconds=next_sync_eta,
@@ -154,7 +159,6 @@ async def force_sync(
         )
 
     try:
-        import time
         start_time = time.time()
 
         # Step 1: Pull FROM Cloudflare TO local (if method exists)
@@ -166,11 +170,15 @@ async def force_sync(
 
         # Step 2: Push FROM local TO Cloudflare (existing behavior)
         push_result = await storage.force_sync()
-        operations_synced = push_result.get('operations_synced', 0)
+        # BackgroundSyncService.force_sync returns 'synced_to_secondary'; fall back to
+        # 'operations_synced' for compatibility with other implementations.
+        operations_synced = push_result.get('synced_to_secondary', push_result.get('operations_synced', 0))
+        skipped_already_present = push_result.get('skipped_already_present', 0)
 
-        # Check success flags from both operations
+        # Check success flags from both operations. `status == 'completed'` means push
+        # finished (may still have item-level failures, reported via failed_operations).
         pull_success = pull_result.get('success', True) if pull_result else True
-        push_success = push_result.get('success', False)
+        push_success = push_result.get('status') == 'completed' if 'status' in push_result else push_result.get('success', False)
         overall_success = pull_success and push_success
 
         time_taken = time.time() - start_time
@@ -182,6 +190,8 @@ async def force_sync(
             combined_message = f"Pulled {memories_pulled} from Cloudflare"
         elif operations_synced > 0:
             combined_message = f"Pushed {operations_synced} to Cloudflare"
+        elif skipped_already_present > 0:
+            combined_message = f"No changes to sync ({skipped_already_present} already synchronized)"
         else:
             combined_message = "No changes to sync (already synchronized)"
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mcp-memory-service"
-version = "10.36.4"
+version = "10.40.1"
 description = "Semantic memory layer for AI applications. REST API + MCP transport + knowledge graph + autonomous consolidation. Works with 14+ AI clients. Self-host, zero cloud cost."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -59,6 +59,7 @@ dependencies = [
     "sse-starlette>=2.1.0",
     "tokenizers>=0.22.2",
     "torch>=2.0.0",
+    "transformers>=4.30,<5.0.0",
     "typing-extensions>=4.0.0; python_version < '3.11'",
     "uvicorn>=0.30.0",
     "zeroconf>=0.130.0",
@@ -89,6 +90,18 @@ sqlite = [
 # SQLite-vec with full ML capabilities (for advanced features)
 sqlite-ml = [
     "mcp-memory-service[sqlite,ml]"
+]
+# Milvus backend — Milvus Lite (single file), self-hosted Milvus, or Zilliz Cloud.
+# Shipped with the ML extras so sentence-transformers embeddings are available.
+milvus = [
+    "pymilvus>=2.5.0",
+    "milvus-lite>=2.4.10",
+    # milvus-lite 2.5.x still imports `pkg_resources` from setuptools; that API
+    # was removed in setuptools 81. Pin setuptools below 81 on newer Pythons
+    # where the default wheels are affected. Safe no-op on Pythons that resolve
+    # older setuptools naturally.
+    "setuptools<81; python_version >= '3.13'",
+    "mcp-memory-service[ml]",
 ]
 # Full installation including all optional dependencies
 full = [
