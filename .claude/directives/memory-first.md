@@ -18,6 +18,31 @@ When you need information about this project, follow this order:
 - What's the current API? → Check the code
 - What's configured? → Read config files
 
+### 1.5 Proactive Memory Storage
+
+**When the conversation produces valuable conclusions, proactively store them without being asked:**
+
+**Technical:**
+- Technical decisions or architecture choices → `memory_type: decision`
+- Debugging findings with root cause and fix → `memory_type: error`
+- Gotchas, best practices, lessons learned → `memory_type: learning`
+- Recurring patterns or issues → `memory_type: pattern`
+- Analysis conclusions (benchmarks, comparisons, architecture reviews) → `memory_type: observation`
+
+**Business logic:**
+- Business logic, data flows, module responsibilities → `memory_type: observation`, tag: `业务逻辑`
+- API contracts, upstream/downstream dependencies → `memory_type: observation`, tag: `接口`
+- Business rules, edge cases, special handling → `memory_type: learning`, tag: `业务规则`
+- Data models, table structures, field semantics → `memory_type: observation`, tag: `数据模型`
+- Deployment topology, environment differences → `memory_type: observation`, tag: `部署`
+
+**Collaboration:**
+- Confirmed requirements and agreements with user → `memory_type: decision`
+- Project-specific coding conventions → `memory_type: pattern`
+- Environment info, credentials, access methods → `memory_type: observation`, tag: `环境`
+
+**Format:** Summarize to ~500 chars, don't store raw conversation. Split into multiple memories if information-dense.
+
 ### 2. Memory Second (Historical Context)
 
 **Search memory when files don't explain WHY:**
