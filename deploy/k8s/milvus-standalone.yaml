@@ -1,0 +1,295 @@
+# ============================================================
+# Milvus Standalone 部署脚本（原生 YAML，无需 Helm）
+#
+# 组件：
+#   - etcd：元数据存储（Milvus 依赖）
+#   - MinIO：对象存储（存放索引段和日志）
+#   - Milvus Standalone：向量数据库（端口 19530）
+#
+# 部署命令：kubectl apply -f milvus-standalone.yaml
+# 卸载命令：kubectl delete -f milvus-standalone.yaml
+#
+# 部署后集群内访问地址：
+#   milvus.mcp-system.svc.cluster.local:19530
+#
+# 验证：
+#   kubectl -n mcp-system get pods -l component=milvus
+#   kubectl -n mcp-system logs -f deployment/milvus-standalone
+# ============================================================
+
+---
+# ==================== 1. etcd ====================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-etcd-data
+  namespace: mcp-system
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: cfs
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-etcd
+  namespace: mcp-system
+  labels:
+    app: milvus-etcd
+    component: milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-etcd
+  template:
+    metadata:
+      labels:
+        app: milvus-etcd
+        component: milvus
+    spec:
+      containers:
+      - name: etcd
+        image: unipus.tencentcloudcr.com/unipus/mcp/etcd:v3.5.16
+        command:
+        - etcd
+        - --name=default
+        - --advertise-client-urls=http://0.0.0.0:2379
+        - --listen-client-urls=http://0.0.0.0:2379
+        - --listen-peer-urls=http://0.0.0.0:2380
+        - --initial-advertise-peer-urls=http://0.0.0.0:2380
+        - --initial-cluster=default=http://0.0.0.0:2380
+        - --data-dir=/var/lib/etcd
+        - --auto-compaction-mode=revision
+        - --auto-compaction-retention=1000
+        - --max-request-bytes=33554432
+        - --quota-backend-bytes=4294967296
+        ports:
+        - containerPort: 2379
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/etcd
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 2379
+          initialDelaySeconds: 10
+          periodSeconds: 15
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: milvus-etcd-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-etcd
+  namespace: mcp-system
+spec:
+  selector:
+    app: milvus-etcd
+  ports:
+  - port: 2379
+    targetPort: 2379
+
+---
+# ==================== 2. MinIO ====================
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: milvus-minio-data
+  namespace: mcp-system
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  storageClassName: cfs
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-minio
+  namespace: mcp-system
+  labels:
+    app: milvus-minio
+    component: milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-minio
+  template:
+    metadata:
+      labels:
+        app: milvus-minio
+        component: milvus
+    spec:
+      containers:
+      - name: minio
+        image: unipus.tencentcloudcr.com/unipus/mcp/minio:RELEASE.2024-11-07T00-52-20Z
+        command:
+        - minio
+        - server
+        - /data
+        - --console-address
+        - ":9001"
+        env:
+        - name: MINIO_ROOT_USER
+          value: "minioadmin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "minioadmin"
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+        volumeMounts:
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /minio/health/live
+            port: 9000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: 9000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: milvus-minio-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus-minio
+  namespace: mcp-system
+spec:
+  selector:
+    app: milvus-minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: 9000
+  - name: console
+    port: 9001
+    targetPort: 9001
+
+---
+# ==================== 3. Milvus Standalone ====================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus-standalone
+  namespace: mcp-system
+  labels:
+    app: milvus-standalone
+    component: milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: milvus-standalone
+  template:
+    metadata:
+      labels:
+        app: milvus-standalone
+        component: milvus
+    spec:
+      containers:
+      - name: milvus
+        image: unipus.tencentcloudcr.com/unipus/mcp/milvus:v2.5.6
+        command: ["milvus", "run", "standalone"]
+        env:
+        - name: ETCD_ENDPOINTS
+          value: "milvus-etcd.mcp-system.svc.cluster.local:2379"
+        - name: MINIO_ADDRESS
+          value: "milvus-minio.mcp-system.svc.cluster.local:9000"
+        - name: MINIO_ACCESS_KEY
+          value: "minioadmin"
+        - name: MINIO_SECRET_KEY
+          value: "minioadmin"
+        ports:
+        - containerPort: 19530
+          name: grpc
+        - containerPort: 9091
+          name: metrics
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 9091
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 30   # 最多等 5 分钟
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9091
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 9091
+          periodSeconds: 10
+      # Milvus 需要等 etcd 和 minio 先就绪
+      initContainers:
+      - name: wait-etcd
+        image: unipus.tencentcloudcr.com/unipus/mcp/busybox:1.36
+        command: ['sh', '-c', 'until nc -z milvus-etcd.mcp-system.svc.cluster.local 2379; do echo "waiting for etcd..."; sleep 3; done']
+      - name: wait-minio
+        image: unipus.tencentcloudcr.com/unipus/mcp/busybox:1.36
+        command: ['sh', '-c', 'until nc -z milvus-minio.mcp-system.svc.cluster.local 9000; do echo "waiting for minio..."; sleep 3; done']
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus
+  namespace: mcp-system
+spec:
+  type: NodePort
+  selector:
+    app: milvus-standalone
+  ports:
+  - name: grpc
+    port: 19530
+    targetPort: 19530
+    nodePort: 30530
+  - name: metrics
+    port: 9091
+    targetPort: 9091

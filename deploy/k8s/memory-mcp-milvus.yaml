@@ -1,0 +1,214 @@
+# ============================================================
+# Memory MCP 部署脚本（Milvus 后端版）
+#
+# 功能：为 AI 编程助手（Kiro/Cursor/Claude Desktop 等）提供
+#       持久化语义记忆服务，支持存储、检索、知识图谱关联
+# 技术栈：
+#   - 向量数据库：Milvus Standalone（独立部署，生产级）
+#   - Embedding 模型：BAAI/bge-small-zh-v1.5（512 维，sentence-transformers，中文优化）
+#   - 传输协议：Streamable HTTP（MCP 标准协议）
+#   - 新增特性：BM25 全文检索混合搜索、MilvusGraphStorage 知识图谱
+#
+# 前置条件：
+#   1. 已部署 Milvus：kubectl apply -f milvus-standalone.yaml
+#   2. 已推送镜像到 TCR
+#
+# 镜像构建命令（在项目根目录执行）：
+#   docker build -f tools/docker/Dockerfile \
+#     --build-arg INSTALL_EXTRA="[milvus]" \
+#     -t unipus.tencentcloudcr.com/unipus/mcp/memory-mcp:milvus \
+#     .
+#   docker push unipus.tencentcloudcr.com/unipus/mcp/memory-mcp:milvus
+#
+# 注意：与原 SQLite 版（memory-mcp）并行部署，互不冲突
+#   - SQLite 版：memory-mcp，NodePort 30527，memory-mcp.unipus.cn
+#   - Milvus 版：memory-mcp-milvus，NodePort 30528，semgrep-mcp.unipus.cn（复用测试）
+#
+# 部署命令：kubectl apply -f memory-mcp-milvus.yaml
+# 卸载命令：kubectl delete -f memory-mcp-milvus.yaml
+#
+# ⚠️ 部署前需先停掉 semgrep-mcp（域名被复用）：
+#   kubectl -n mcp-system scale deployment semgrep-mcp --replicas=0
+#
+# 验证 Milvus 版后，迁移数据，再删除 SQLite 版：
+#   kubectl delete -f memory-mcp-standalone.yaml
+#
+# 部署后 IDE 配置示例（以 Kiro 为例）：
+#   {
+#     "mcpServers": {
+#       "memory": {
+#         "type": "streamable-http",
+#         "url": "http://semgrep-mcp.unipus.cn/mcp"
+#       }
+#     }
+#   }
+# ============================================================
+
+---
+# ==================== 1. 命名空间 ====================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mcp-system
+  labels:
+    name: mcp-system
+
+---
+# ==================== 2. Deployment ====================
+# Milvus 后端不需要 PVC（数据存在 Milvus 集群里）
+# 比 SQLite 版简单，无需挂载本地存储
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-mcp-milvus
+  namespace: mcp-system
+  labels:
+    app: memory-mcp-milvus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-mcp-milvus
+  template:
+    metadata:
+      labels:
+        app: memory-mcp-milvus
+    spec:
+      # ---------- 模型预加载 ----------
+      # 用 initContainer 从模型镜像拷贝 bge-small-zh-v1.5 到共享 volume
+      # 避免运行时联网下载（K8s 节点可能无外网）
+      initContainers:
+      - name: load-model
+        image: unipus.tencentcloudcr.com/unipus/mcp/embedding-model:bge-zh-v1.5
+        command: ['sh', '-c', 'cp -r /models/* /model-cache/ && cd /model-cache/hub && ln -sf models--BAAI--bge-small-zh-v1.5 models--sentence-transformers--BAAI--bge-small-zh-v1.5']
+        volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+      containers:
+      - name: memory
+        image: unipus.tencentcloudcr.com/unipus/mcp/memory-mcp:milvus-cpu
+        ports:
+        - containerPort: 8765
+          protocol: TCP
+        env:
+        # ---------- 运行模式 ----------
+        # 使用 streamable-http 模式（MCP 标准协议）
+        - name: MCP_MODE
+          value: "streamable-http"
+        # HTTP 服务监听地址（必须 0.0.0.0，否则探针失败）
+        - name: MCP_SSE_HOST
+          value: "0.0.0.0"
+        - name: MCP_SSE_PORT
+          value: "8765"
+
+        # ---------- 存储后端 ----------
+        - name: MCP_MEMORY_STORAGE_BACKEND
+          value: "milvus"
+        # 指向同 namespace 的 Milvus 服务
+        - name: MCP_MILVUS_URI
+          value: "http://milvus.mcp-system.svc.cluster.local:19530"
+        - name: MCP_MILVUS_COLLECTION_NAME
+          value: "mcp_memory"
+        # Milvus 认证（如果 Milvus 开了 auth，取消注释）
+        # - name: MCP_MILVUS_TOKEN
+        #   value: "your-token"
+
+        # ---------- 模型配置 ----------
+        # 使用中文优化的 bge-small-zh-v1.5（512 维）
+        - name: MCP_EMBEDDING_MODEL
+          value: "BAAI/bge-small-zh-v1.5"
+        # HF_HOME 指向 initContainer 拷贝的模型缓存
+        - name: HF_HOME
+          value: "/model-cache"
+        # 禁止联网下载，强制使用本地缓存
+        - name: HF_HUB_OFFLINE
+          value: "1"
+
+        # ---------- 其他配置 ----------
+        # 允许匿名访问（内网使用，无需认证）
+        - name: MCP_ALLOW_ANONYMOUS_ACCESS
+          value: "true"
+
+        volumeMounts:
+        - name: model-cache
+          mountPath: /model-cache
+          readOnly: true
+
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: "2"
+            memory: 4Gi    # sentence-transformers 模型加载需要内存
+
+        # 启动探针：首次加载 embedding 模型需要 30-120 秒
+        startupProbe:
+          tcpSocket:
+            port: 8765
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 60  # 最多等 10 分钟
+
+        # 存活探针
+        livenessProbe:
+          tcpSocket:
+            port: 8765
+          initialDelaySeconds: 120
+          periodSeconds: 30
+
+        # 就绪探针
+        readinessProbe:
+          tcpSocket:
+            port: 8765
+          initialDelaySeconds: 60
+          periodSeconds: 10
+      volumes:
+      - name: model-cache
+        emptyDir: {}
+
+---
+# ==================== 3. Service ====================
+# NodePort 方式暴露，端口 30527（与原 SQLite 版一致）
+# 集群内访问：memory-mcp-milvus.mcp-system.svc.cluster.local:9528
+# 集群外访问：<任意节点IP>:30528
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-mcp-milvus
+  namespace: mcp-system
+spec:
+  type: NodePort
+  ports:
+  - port: 9528
+    targetPort: 8765
+    nodePort: 30529
+    protocol: TCP
+  selector:
+    app: memory-mcp-milvus
+
+---
+# ==================== 4. Ingress ====================
+# 复用 semgrep-mcp.unipus.cn 域名进行测试
+# ⚠️ 部署前需先停掉 semgrep-mcp 的 Deployment，避免 Ingress 冲突
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ing-memory-mcp-milvus
+  namespace: mcp-system
+  annotations:
+    kubernetes.io/ingress.class: traefik-test
+    traefik.ingress.kubernetes.io/router.priority: "10"
+spec:
+  ingressClassName: traefik-test
+  rules:
+  - host: semgrep-mcp.unipus.cn
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: memory-mcp-milvus
+            port:
+              number: 9528

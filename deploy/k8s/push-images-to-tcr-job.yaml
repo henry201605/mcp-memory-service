@@ -1,0 +1,94 @@
+# =============================================================================
+# K8s Job: 将外网镜像搬运到腾讯云 TCR
+# 使用 crane（无需 docker daemon）
+#
+# 使用前：先创建 TCR 登录凭据 Secret
+#   kubectl -n mcp-system create secret docker-registry tcr-creds \
+#     --docker-server=unipus.tencentcloudcr.com \
+#     --docker-username=<用户名> \
+#     --docker-password=<密码>
+#
+# 执行：kubectl apply -f deploy/k8s/push-images-to-tcr-job.yaml
+# 查看进度：kubectl -n mcp-system logs -f job/push-images-to-tcr
+# 清理：kubectl -n mcp-system delete job push-images-to-tcr
+# =============================================================================
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: push-images-to-tcr
+  namespace: mcp-system
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: crane
+        image: gcr.io/go-containerregistry/crane:latest
+        command: ["/busybox/sh"]
+        args:
+        - -c
+        - |
+          set -e
+          TCR="unipus.tencentcloudcr.com/unipus/mcp"
+
+          # 从 Secret 读取 TCR 凭据并登录
+          if [ -f /tcr-creds/.dockerconfigjson ]; then
+            mkdir -p $HOME/.docker
+            cp /tcr-creds/.dockerconfigjson $HOME/.docker/config.json
+            echo "✅ TCR 凭据已加载"
+          else
+            echo "❌ 未找到 TCR 凭据，请先创建 tcr-creds Secret"
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "  开始搬运镜像到 TCR"
+          echo "============================================"
+
+          # 1. python:3.12-slim
+          echo ""
+          echo "[1/5] python:3.12-slim"
+          crane copy docker.io/library/python:3.12-slim ${TCR}/python:3.12-slim && echo "  ✅ 完成" || echo "  ❌ 失败"
+
+          # 2. etcd
+          echo ""
+          echo "[2/5] etcd:v3.5.16"
+          crane copy quay.io/coreos/etcd:v3.5.16 ${TCR}/etcd:v3.5.16 && echo "  ✅ 完成" || echo "  ❌ 失败"
+
+          # 3. minio
+          echo ""
+          echo "[3/5] minio"
+          crane copy docker.io/minio/minio:RELEASE.2024-11-07T00-52-20Z ${TCR}/minio:RELEASE.2024-11-07T00-52-20Z && echo "  ✅ 完成" || echo "  ❌ 失败"
+
+          # 4. milvus
+          echo ""
+          echo "[4/5] milvus:v2.5.6"
+          crane copy docker.io/milvusdb/milvus:v2.5.6 ${TCR}/milvus:v2.5.6 && echo "  ✅ 完成" || echo "  ❌ 失败"
+
+          # 5. busybox
+          echo ""
+          echo "[5/5] busybox:1.36"
+          crane copy docker.io/library/busybox:1.36 ${TCR}/busybox:1.36 && echo "  ✅ 完成" || echo "  ❌ 失败"
+
+          echo ""
+          echo "============================================"
+          echo "  全部完成！"
+          echo "============================================"
+        volumeMounts:
+        - name: tcr-creds
+          mountPath: /tcr-creds
+          readOnly: true
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 1
+            memory: 1Gi
+      volumes:
+      - name: tcr-creds
+        secret:
+          secretName: tcr-creds
