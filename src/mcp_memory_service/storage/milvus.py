@@ -1140,6 +1140,7 @@ class MilvusMemoryStorage(MemoryStorage):
         n_results: int = 5,
         tags: Optional[List[str]] = None,
         min_confidence: float = 0.0,
+        include_superseded: bool = False,
     ) -> List[MemoryQueryResult]:
         logger.debug("retrieve() entry — self.client is None: %r", self.client is None)
         if not self._ensure_initialized():
@@ -1674,6 +1675,7 @@ class MilvusMemoryStorage(MemoryStorage):
         offset: int = 0,
         memory_type: Optional[str] = None,
         tags: Optional[List[str]] = None,
+        stale_days: Optional[int] = None,
     ) -> List[Memory]:
         if not self._ensure_initialized():
             return []

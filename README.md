@@ -2,7 +2,7 @@
 
 ## Persistent Shared Memory for AI Agent Pipelines
 
-Open-source memory backend for multi-agent systems.
+Open-source memory backend for AI agents — **REST API, MCP, OAuth, CLI, dashboard**. One self-hosted service, every transport.
 Agents store decisions, share causal knowledge graphs, and retrieve
 context in 5ms — without cloud lock-in or API costs.
 
@@ -157,7 +157,7 @@ A production-tested self-hosted deployment using Docker containers behind a Clou
 - Use Cloudflare ZeroTrust with subnet-based access control (e.g., allow Anthropic subnets + your own IPs)
 - Add **Client IP Address Filtering** to all Cloudflare API tokens (Dashboard → My Profile → API Tokens → Edit → Client IP Address Filtering) to limit abuse if a token leaks
 - If using IPv6, include your IPv6 /64 network in the allowlist (Python prefers IPv6 by default)
-- Set `MCP_OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES=1440` to extend OAuth tokens to 24 hours (refresh tokens not yet supported)
+- For long-running browser sessions, request the `offline_access` scope during authorization to receive a rotating `refresh_token` (lifetime via `MCP_OAUTH_REFRESH_TOKEN_EXPIRE_DAYS`, default 30 days). Without this scope, access tokens are the only credential — extend `MCP_OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES` up to `1440` (24h) if you need longer single-shot sessions.
 - Consider an auth proxy like [AuthMCP](https://github.com/loglux/authmcp-gateway) or [mcp-auth-proxy](https://github.com/sigbit/mcp-auth-proxy) for robust session management
 
 ## Comparison with Alternatives
@@ -182,7 +182,7 @@ A production-tested self-hosted deployment using Docker containers behind a Clou
 
 ### vs. MCP-Native Alternatives
 
-[MemPalace](https://github.com/milla-jovovich/mempalace) is an MCP-native alternative that went viral in April 2026 with strong LongMemEval claims. A [community code review (Issue #27)](https://github.com/milla-jovovich/mempalace/issues/27) subsequently showed that the headline numbers reflect the underlying vector store rather than the advertised Palace architecture, and the maintainers acknowledged most points. We keep the comparison here for transparency, but readers should interpret the scores with that context in mind.
+[MemPalace](https://github.com/MemPalace/mempalace) is an MCP-native alternative that went viral in April 2026 with strong LongMemEval claims. A [community code review (Issue #27)](https://github.com/MemPalace/mempalace/issues/27) subsequently showed that the headline numbers reflect the underlying vector store rather than the advertised Palace architecture, and the maintainers acknowledged most points. We keep the comparison here for transparency, but readers should interpret the scores with that context in mind.
 
 | | **MemPalace** | **mcp-memory-service** |
 |---|---|---|
@@ -202,7 +202,7 @@ A production-tested self-hosted deployment using Docker containers behind a Clou
 1. **Ingestion granularity.** MemPalace stores each conversation as a single unit (session-level). LongMemEval asks "which session contains the answer?" — a question that session-level storage answers structurally. mcp-memory-service defaults to turn-level storage (one entry per message), which enables fine-grained retrieval ("what exactly did the user say about X?") but spreads a session's signal across many entries. Using `memory_store_session` (added in v10.35.0) brings our score to **86.0% R@5**.
 2. **What the 96.6% actually measures.** Per Issue #27, MemPalace's headline number is produced in "raw mode" — plain text stored in ChromaDB with default embeddings. The Palace architecture (Wings, Rooms, Halls) is **not active** in that configuration; "Halls" exist only as metadata strings with no effect on ranking. The 96.6% is therefore a ChromaDB + default-embedding baseline, not a measurement of MemPalace's structural retrieval features. A direct "apples-to-apples" architectural comparison is not possible with the published numbers.
 
-> ¹ Measured in MemPalace "raw mode" (plain text in ChromaDB with default embeddings). Per [Issue #27](https://github.com/milla-jovovich/mempalace/issues/27), the Palace structural features are bypassed in this configuration.
+> ¹ Measured in MemPalace "raw mode" (plain text in ChromaDB with default embeddings). Per [Issue #27](https://github.com/MemPalace/mempalace/issues/27), the Palace structural features are bypassed in this configuration.
 >
 > ² 100% result uses optional LLM reranking (~500 API calls) on a partially tuned test set. Clean held-out score (as reported by the maintainers): **98.4% R@5**.
 
@@ -366,6 +366,39 @@ Choose from:
 
 ---
 
+## 🛠️ CLI Server Lifecycle Commands
+
+In addition to `memory server --http` (foreground mode), the CLI now includes
+server lifecycle commands for background HTTP management:
+
+```bash
+# Start HTTP server in background (default host=127.0.0.1, port=8000)
+memory launch
+
+# Start on a custom port
+memory launch --port 8192
+
+# Check status and health
+memory info --port 8192
+memory health --port 8192
+
+# View recent logs and stop server
+memory logs --lines 50
+memory stop --port 8192
+```
+
+These commands are optimized for fast startup and avoid loading heavy ML
+dependencies unless needed.
+
+⚠️  **Security Note**: By default, the server binds to `127.0.0.1` (localhost only).
+To expose the server on your network or allow remote access, you can use
+`--host 0.0.0.0` or set `MCP_HTTP_HOST=0.0.0.0`. However, **this exposes the
+API to your network** and should be done only in trusted environments with
+proper authentication and firewall rules in production. For untrusted networks,
+use TLS termination (reverse proxy with HTTPS) or VPN overlays.
+
+---
+
 ## 💡 Why You Need This
 
 ### The Problem
@@ -423,6 +456,26 @@ Export memories from mcp-memory-service → Import to shodh-cloudflare → Sync 
 🔒 **Privacy-First** – Local-first, you control your data
 📊 **Web Dashboard** – Visualize and manage memories at `http://localhost:8000`
 🧬 **Knowledge Graph** – Interactive D3.js visualization of memory relationships 🆕
+🏠 **Homelab Quality Scoring** – Point scoring at any OpenAI-compatible endpoint (Ollama, LiteLLM, vLLM) 🆕
+
+**Homelab / self-hosted quality scoring** (v10.45.0+): set `MCP_QUALITY_AI_PROVIDER=openai-compatible` to score memories with your local LLM instead of ONNX or a cloud API:
+
+```bash
+MCP_QUALITY_AI_PROVIDER=openai-compatible
+MCP_QUALITY_AI_BASE_URL=http://localhost:11434/v1   # Ollama
+MCP_QUALITY_AI_MODEL=qwen2.5:7b-instruct
+# MCP_QUALITY_AI_API_KEY=ollama                     # optional
+```
+
+Recommended models: `qwen2.5:7b-instruct` (Ollama), `mlx-community/Qwen2.5-7B-Instruct-4bit` (MLX), or any instruct model via LiteLLM proxy. On endpoint failure, scoring falls back to implicit signals automatically.
+
+**Docker `:quality-cpu` tag** — for users who want the built-in local ONNX quality scoring (`ms-marco-MiniLM-L-6-v2` and `nvidia-quality-classifier-deberta`) without managing the one-time ONNX export themselves, and without shipping `torch`/`transformers` in their container:
+
+```bash
+docker pull doobidoo/mcp-memory-service:quality-cpu
+```
+
+The `:quality-cpu` image pre-exports both models at build time and ships only `onnxruntime` at runtime — no PyTorch dependency at deploy time. See [`tools/docker/README.md`](tools/docker/README.md) for details.
 
 ### 🖥️ Dashboard Preview (v9.3.0)
 
@@ -437,19 +490,38 @@ Export memories from mcp-memory-service → Import to shodh-cloudflare → Sync 
 ---
 
 
-## Latest Release: **v10.40.3** (April 24, 2026)
+## Latest Release: **v10.51.0** (May 7, 2026)
 
-**fix(claude-hooks): eliminate socket hang-up and raise hook timeout**
+**feat(plugins): live plugin hooks + dynamic type dropdowns + audit-log example (PRs #863, #864, #867, @filhocf)**
 
 **What's New:**
-- **Socket hang-up eliminated**: Node.js HTTPS agent `keepAlive` caused dead-socket reuse across multi-phase retrieval — hook silently dropped memories. Fixed with `agent: false` + `Connection: close` on all HTTP paths.
-- **Hook timeout raised 9.5 s → 28 s**: Multi-phase retrieval (git + recent + tagged) takes 12–15 s cold; old budget expired before the injection block was written. Claude Code VSCode extension now reliably shows the memory-context block.
-- **Installer outer timeout raised 10 s → 30 s**: `~/.claude/settings.json` kill limit now matches the new internal budget.
-- **1,675 Python tests** passing.
+- **Plugin hooks are now live**: Fire points wired into `MemoryService` — `on_store`, `on_delete`, `on_retrieve`, `on_consolidate` called at actual lifecycle events. Third-party plugins receive live events. (PR #864)
+- **Dynamic type dropdowns**: New `GET /api/types` endpoint returns all valid memory types (built-in + custom). Dashboard filter and store-form dropdowns now populate from this endpoint automatically. (PR #863)
+- **Audit-log example plugin**: Reference implementation in `examples/plugins/audit_log/` demonstrating all four hooks with `entry_points` packaging. Living documentation for the plugin API. (PR #867)
 
 ---
 
 **Previous Releases**:
+- **v10.50.0** - feat(plugins): plugin hook scaffolding — on_store, on_delete, on_retrieve, on_consolidate (PR #856, @filhocf)
+- **v10.49.4** - fix(consolidation): protect high-value mistake notes from decay/forgetting (PR #854, @filhocf)
+- **v10.49.3** - fix(opencode): correct API path, payload field, and client-side tag filter (PRs #849, #850)
+- **v10.49.2** - fix(ontology): register custom base types with empty subtype lists (PR #846)
+- **v10.49.1** - fix: surface memory_type ontology coercion warnings + uvx CI flake fix (PR #844)
+- **v10.49.0** - feat(cli): lazy lifecycle commands and faster startup (PR #841, @creativelaides)
+- **v10.48.0** - feat: include_superseded retrieval filter + auto-mark on contradiction (PR #814, @filhocf)
+- **v10.47.2** - fix(consolidation): disable-by-default schedule prevents unintended automatic consolidation (PR #821, closes #808)
+- **v10.47.1** - fix(web): surface /server/update failures end-to-end (PR #807, closes #729)
+- **v10.47.0** - feat: memory_quality maintain orchestrator + Docker DeBERTa quantization (PRs #802, #803, @filhocf, closes #799, #793)
+- **v10.46.0** - feat: stale_days filter for memory_list — dormant memory detection (PR #796, @filhocf, closes #784)
+- **v10.45.1** - fix: CodeQL redundant import cleanup + soft-delete regression tests (PRs #794, #795, @filhocf)
+- **v10.45.0** - feat(quality): OpenAI-compatible provider for LiteLLM/Ollama/MLX + soft-delete UPDATE guards (PRs #790, #783, @filhocf)
+- **v10.44.0** - feat: Mistake Notes — structured error replay (`mistake_note_add`, `mistake_note_search`, PR #786, @filhocf)
+- **v10.43.0** - feat(search): Reciprocal Rank Fusion (RRF) for SQLite-vec hybrid search (PR #773, @filhocf)
+- **v10.42.1** - fix(milvus): add missing `anns_field` to search calls for BM25-enabled collections (PR #775, @henry201605)
+- **v10.42.0** - feat(milvus): MilvusGraphStorage, BM25 hybrid search, and consolidation integration (PR #762, @henry201605)
+- **v10.41.0** - feat(oauth): OAuth 2.1 refresh_token grant with rotation, memory_graph on streamable-http (PRs #766, #759)
+- **v10.40.4** - fix(quality): handle shape (1, 1) cross-encoder logits in ONNX ranker (PR #765)
+- **v10.40.3** - fix(claude-hooks): eliminate socket hang-up and raise hook timeout (PR #761)
 - **v10.40.2** - fix(docker): correct invalid Python one-liner in ONNX pre-download (PR #757)
 - **v10.40.1** - fix(sync): CF hybrid sync reliability + reporting accuracy (PRs #751, #753)
 - **v10.40.0** - feat: Milvus storage backend (Lite / self-hosted / Zilliz Cloud), OAuth XSS hardening, plugin shape validation (PRs #721, #745, #740)
@@ -615,6 +687,7 @@ If you encounter issues during migration:
 - **[Architecture Overview](docs/architecture.md)** – How it works under the hood
 - **[Team Setup Guide](docs/setup-guide.md#path-4-full-stack)** – OAuth and cloud collaboration
 - **[Knowledge Graph Dashboard](docs/features/knowledge-graph-dashboard.md)** 🆕 – Interactive graph visualization guide
+- **[Memory Type Ontology](docs/memory-ontology.md)** 🆕 – Built-in taxonomy and `MCP_CUSTOM_MEMORY_TYPES` env var
 - **[Troubleshooting](docs/troubleshooting/)** – Common issues and solutions
 - **[API Reference](https://github.com/doobidoo/mcp-memory-service/wiki)** – Programmatic usage
 - **[Wiki](https://github.com/doobidoo/mcp-memory-service/wiki)** – Complete documentation

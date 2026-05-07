@@ -160,6 +160,7 @@ class DreamInspiredConsolidator:
         self.storage = storage
         self.config = config
         self.logger = logging.getLogger(__name__)
+        self.plugin_registry = None  # Set externally to fire on_consolidate hook
 
         # Initialize component engines
         self.decay_calculator = ExponentialDecayCalculator(config)
@@ -409,7 +410,16 @@ class DreamInspiredConsolidator:
                     await self._update_consolidation_timestamps(memories)
 
                 # 9. Finalize report
-                return self._finalize_report(report, [])
+                report = self._finalize_report(report, [])
+                if self.plugin_registry:
+                    await self.plugin_registry.fire('on_consolidate', {
+                        **report.performance_metrics,
+                        'time_horizon': report.time_horizon,
+                        'memories_processed': report.memories_processed,
+                        'associations_discovered': report.associations_discovered,
+                        'clusters_created': report.clusters_created,
+                    })
+                return report
 
         except ConsolidationError as e:
             # Re-raise configuration and validation errors
@@ -659,6 +669,7 @@ class DreamInspiredConsolidator:
 
         stored_count = 0
         failed_count = 0
+        supersede_pairs = []
 
         # Build hash -> memory lookup map for efficiency
         all_memories = await self.storage.get_all_memories()
@@ -688,6 +699,7 @@ class DreamInspiredConsolidator:
 
                 # Infer relationship type if both memories available
                 relationship_type = "related"
+                confidence = 0.0
                 if source_memory and target_memory:
                     try:
                         (
@@ -733,12 +745,35 @@ class DreamInspiredConsolidator:
 
                 if success:
                     stored_count += 1
+
+                    # Collect contradiction pairs for batch superseding (#732)
+                    if (
+                        relationship_type == "contradicts"
+                        and confidence >= 0.75
+                        and source_memory
+                        and target_memory
+                    ):
+                        source_ts = source_memory.created_at or 0.0
+                        target_ts = target_memory.created_at or 0.0
+                        if source_ts >= target_ts:
+                            supersede_pairs.append((source_memory.content_hash, target_memory.content_hash))
+                        else:
+                            supersede_pairs.append((target_memory.content_hash, source_memory.content_hash))
                 else:
                     failed_count += 1
 
             except Exception as e:
                 failed_count += 1
                 self.logger.warning(f"Failed to store association in graph table: {e}")
+
+        # Batch-mark superseded memories in a single transaction (#732)
+        if supersede_pairs:
+            storage = getattr(self.storage, "primary_storage", None) or self.storage
+            if hasattr(storage, 'mark_superseded_batch'):
+                marked = await storage.mark_superseded_batch(supersede_pairs)
+                self.logger.info(
+                    f"Auto-superseded {marked} memories on contradiction detection"
+                )
 
         self.logger.info(
             f"Stored {stored_count} associations in graph table ({failed_count} failed)"

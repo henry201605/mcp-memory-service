@@ -751,6 +751,8 @@ class MemoryServer:
                 
                 # Initialize the consolidator with storage
                 self.consolidator = DreamInspiredConsolidator(self.storage, config)
+                if hasattr(self, 'memory_service'):
+                    self.consolidator.plugin_registry = self.memory_service._plugin_registry
                 logger.info("Dream-inspired consolidator initialized")
                 
                 # Initialize the scheduler if not disabled
@@ -1255,7 +1257,12 @@ class MemoryServer:
         async def handle_list_tools() -> List[types.Tool]:
             """Return list of available MCP tools.
 
-            Note: This list only includes modern unified tools (12 total).
+            Note: This list only includes modern unified tools (18 total:
+            memory_store, memory_store_session, memory_search, memory_list,
+            memory_delete, memory_cleanup, memory_health, memory_stats,
+            memory_update, memory_consolidate, memory_ingest, memory_harvest,
+            memory_quality, memory_graph, memory_conflicts, memory_resolve,
+            mistake_note_add, mistake_note_search).
             Deprecated tools continue working via the backwards
             compatibility layer in compat.py but are not advertised to clients.
             """
@@ -1335,7 +1342,7 @@ class MemoryServer:
                                         },
                                         "type": {
                                             "type": "string",
-                                            "description": "Optional type or category label for the memory, e.g., 'note', 'fact', 'reminder'."
+                                            "description": "Optional memory type. Validated against the built-in ontology. Common base types: observation, decision, learning, error, pattern, planning, ceremony, milestone, stakeholder, meeting, research, communication. Common subtypes: note, reference, code_edit, command, document, insight, gotcha, bug, action_item, finding. Unknown types are silently coerced to 'observation' and the response includes a warning. Register additional types via the MCP_CUSTOM_MEMORY_TYPES env var, e.g. '{\"foo\": [\"sub_a\", \"sub_b\"]}'. See docs/memory-ontology.md for the full taxonomy."
                                         }
                                     }
                                 }
@@ -1503,6 +1510,11 @@ Examples:
                                 "max_response_chars": {
                                     "type": "number",
                                     "description": "Maximum response size in characters. Truncates at memory boundaries to prevent context overflow. Recommended: 30000-50000. Default: unlimited."
+                                },
+                                "include_superseded": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": "Include memories that have been superseded by newer contradicting memories. Default: false (superseded memories are hidden)."
                                 }
                             }
                         },
@@ -1530,6 +1542,7 @@ PAGINATION:
 FILTERS (combine with AND logic):
 - tags: Filter to memories with ANY of these tags
 - memory_type: Filter by type (note, reference, decision, etc.)
+- stale_days: Filter to memories not accessed in the last N days
 
 Examples:
 {}  // List first 20 memories
@@ -1537,6 +1550,8 @@ Examples:
 {"tags": ["python", "reference"]}
 {"memory_type": "decision", "page_size": 10}
 {"tags": ["important"], "memory_type": "note"}
+{"stale_days": 30}  // Memories not accessed in 30 days
+{"stale_days": 7, "tags": ["archived"]}  // Stale archived memories
 """,
                         inputSchema={
                             "type": "object",
@@ -1562,6 +1577,11 @@ Examples:
                                 "memory_type": {
                                     "type": "string",
                                     "description": "Filter by memory type"
+                                },
+                                "stale_days": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": "Filter to memories not accessed in the last N days. Uses COALESCE(last_accessed, created_at) for memories never read. Currently supported on sqlite-vec backend only."
                                 }
                             }
                         },
@@ -2040,19 +2060,24 @@ ACTIONS:
 - rate: Manually rate a memory's quality (thumbs up/down)
 - get: Get quality metrics for a specific memory
 - analyze: Analyze quality distribution across all memories
+- maintain: Run maintenance cycle (cleanup + conflicts + stale + quality)
+- maintain_status: Get stats from last maintenance run
 
 Examples:
 {"action": "rate", "content_hash": "abc123", "rating": 1, "feedback": "Very useful"}
 {"action": "get", "content_hash": "abc123"}
 {"action": "analyze"}
 {"action": "analyze", "min_quality": 0.5, "max_quality": 1.0}
+{"action": "maintain"}
+{"action": "maintain", "dry_run": false}
+{"action": "maintain_status"}
 """,
                         inputSchema={
                             "type": "object",
                             "properties": {
                                 "action": {
                                     "type": "string",
-                                    "enum": ["rate", "get", "analyze"],
+                                    "enum": ["rate", "get", "analyze", "maintain", "maintain_status"],
                                     "description": "Quality action to perform"
                                 },
                                 "content_hash": {
@@ -2077,6 +2102,11 @@ Examples:
                                     "type": "number",
                                     "default": 1.0,
                                     "description": "For 'analyze': maximum quality threshold"
+                                },
+                                "dry_run": {
+                                    "type": "boolean",
+                                    "default": True,
+                                    "description": "For 'maintain': preview mode — no modifications (default: true)"
                                 }
                             },
                             "required": ["action"]
@@ -2184,6 +2214,38 @@ Examples:
                 tools.extend(conflict_tools)
                 logger.info(f"Added {len(conflict_tools)} conflict detection tools")
 
+                # Mistake Notes tools
+                mistake_tools = [
+                    types.Tool(
+                        name="mistake_note_add",
+                        description="Record a mistake pattern for error replay. Tracks what went wrong and the correct action. Auto-increments failure_count for repeated patterns.",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "error_pattern": {"type": "string", "description": "The error pattern or message"},
+                                "context_signature": {"type": "string", "description": "Context where the error occurred (file, function, task type)"},
+                                "incorrect_action": {"type": "string", "description": "What was done incorrectly"},
+                                "correct_action": {"type": "string", "description": "What should have been done instead"},
+                            },
+                            "required": ["error_pattern", "context_signature", "incorrect_action", "correct_action"],
+                        },
+                    ),
+                    types.Tool(
+                        name="mistake_note_search",
+                        description="Search mistake notes by semantic similarity. Use before starting a task to check for known pitfalls and past errors.",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Search query (error message, context, or task description)"},
+                                "limit": {"type": "integer", "default": 5, "description": "Max results (default: 5)"},
+                            },
+                            "required": ["query"],
+                        },
+                    ),
+                ]
+                tools.extend(mistake_tools)
+                logger.info(f"Added {len(mistake_tools)} mistake note tools")
+
                 logger.info(f"Returning {len(tools)} tools")
                 return tools
             except Exception as e:
@@ -2257,6 +2319,13 @@ Examples:
                 elif name == "memory_resolve":
                     logger.info("Calling handle_memory_resolve")
                     return await self.handle_memory_resolve(arguments)
+
+                elif name == "mistake_note_add":
+                    logger.info("Calling handle_mistake_note_add")
+                    return await self.handle_mistake_note_add(arguments)
+                elif name == "mistake_note_search":
+                    logger.info("Calling handle_mistake_note_search")
+                    return await self.handle_mistake_note_search(arguments)
 
                 # Legacy handlers (for tools that haven't been fully migrated yet)
                 # These will be removed once all old tool definitions are removed
@@ -2657,6 +2726,28 @@ Examples:
 
         ok, msg = await self.storage.resolve_conflict(winner, loser)
         return [types.TextContent(type="text", text=msg)]
+
+    # ─── Mistake Notes Handlers ───────────────────────────────────
+
+    async def handle_mistake_note_add(self, arguments: dict) -> List[types.TextContent]:
+        """Record a mistake pattern for error replay."""
+        await self._ensure_storage_initialized()
+        result = await self.memory_service.mistake_note_add(
+            error_pattern=arguments.get("error_pattern", ""),
+            context_signature=arguments.get("context_signature", ""),
+            incorrect_action=arguments.get("incorrect_action", ""),
+            correct_action=arguments.get("correct_action", ""),
+        )
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+    async def handle_mistake_note_search(self, arguments: dict) -> List[types.TextContent]:
+        """Search mistake notes by semantic similarity."""
+        await self._ensure_storage_initialized()
+        result = await self.memory_service.mistake_note_search(
+            query=arguments.get("query", ""),
+            limit=arguments.get("limit", 5),
+        )
+        return [types.TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
     # ============================================================
     # Test Compatibility Wrapper Methods

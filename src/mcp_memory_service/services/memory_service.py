@@ -32,6 +32,7 @@ from ..config import (
 )
 from ..storage.base import MemoryStorage
 from ..models.memory import Memory
+from ..plugins import PluginContext, PluginRegistry
 from ..utils.content_splitter import split_content
 from ..utils.hashing import generate_content_hash
 from ..quality.async_scorer import async_scorer
@@ -267,13 +268,16 @@ class MemoryService:
 
     def __init__(self, storage: MemoryStorage):
         self.storage = storage
+        self._plugin_registry = PluginRegistry(PluginContext(storage=storage, service=self))
+        self._plugin_registry.discover_and_register()
 
     async def list_memories(
         self,
         page: int = 1,
         page_size: int = 10,
         tag: Optional[str] = None,
-        memory_type: Optional[str] = None
+        memory_type: Optional[str] = None,
+        stale_days: Optional[int] = None,
     ) -> Union[ListMemoriesSuccess, ListMemoriesError]:
         """
         List memories with pagination and optional filtering.
@@ -286,6 +290,8 @@ class MemoryService:
             page_size: Number of memories per page
             tag: Filter by specific tag
             memory_type: Filter by memory type
+            stale_days: Filter to memories not accessed in the last N days.
+                Uses COALESCE(last_accessed, created_at) for memories never read.
 
         Returns:
             Dictionary with memories and pagination info
@@ -300,13 +306,15 @@ class MemoryService:
                 limit=page_size,
                 offset=offset,
                 memory_type=memory_type,
-                tags=tags_list
+                tags=tags_list,
+                stale_days=stale_days,
             )
 
             # Get accurate total count for pagination
             total = await self.storage.count_all_memories(
                 memory_type=memory_type,
-                tags=tags_list
+                tags=tags_list,
+                stale_days=stale_days,
             )
 
             # Format results for API response
@@ -449,6 +457,9 @@ class MemoryService:
                     }
 
                 # If SOME chunks were stored, return partial success
+                for mem_dict in stored_memories:
+                    await self._plugin_registry.fire('on_store', mem_dict)
+
                 return {
                     "success": True,
                     "memories": stored_memories,
@@ -475,6 +486,8 @@ class MemoryService:
                             await async_scorer.score_memory(memory, query="", storage=self.storage)
                         except Exception as e:
                             logger.debug(f"Background quality scoring queued (or failed silently): {e}")
+
+                    await self._plugin_registry.fire('on_store', self._format_memory_response(memory))
 
                     return {
                         "success": True,
@@ -568,6 +581,10 @@ class MemoryService:
                         await async_scorer.score_memory(result.memory, query=query, storage=self.storage)
                     except Exception as e:
                         logger.debug(f"Background quality scoring for retrieved memory failed silently: {e}")
+
+            modified = await self._plugin_registry.fire('on_retrieve', query, results)
+            if isinstance(modified, list):
+                results = modified
 
             return {
                 "memories": results,
@@ -675,6 +692,7 @@ class MemoryService:
         try:
             success, message = await self.storage.delete(content_hash)
             if success:
+                await self._plugin_registry.fire('on_delete', content_hash)
                 return {
                     "success": True,
                     "content_hash": content_hash
@@ -739,3 +757,137 @@ class MemoryService:
             "created_at_iso": memory.created_at_iso,
             "updated_at_iso": memory.updated_at_iso
         }
+
+    # ─── Mistake Notes ────────────────────────────────────────────────
+
+    async def mistake_note_add(
+        self,
+        error_pattern: str,
+        context_signature: str,
+        incorrect_action: str,
+        correct_action: str,
+    ) -> Dict[str, Any]:
+        """
+        Record a mistake pattern for error replay.
+
+        Stores as a regular memory with memory_type='mistake'. If a similar
+        pattern already exists (above dedup threshold), increments failure_count
+        instead of creating a duplicate.
+
+        Args:
+            error_pattern: The error pattern or message
+            context_signature: Context where the error occurred
+            incorrect_action: What was done incorrectly
+            correct_action: What should have been done instead
+
+        Returns:
+            Dictionary with operation result
+        """
+        from ..config import MCP_MISTAKE_NOTE_DEDUP_THRESHOLD
+
+        content = (
+            f"Pattern: {error_pattern}\n"
+            f"Context: {context_signature}\n"
+            f"Wrong: {incorrect_action}\n"
+            f"Right: {correct_action}"
+        )
+
+        try:
+            # Check for existing similar mistake note
+            existing = await self.retrieve_memories(
+                query=f"{error_pattern} {context_signature}",
+                n_results=3,
+                memory_type="mistake",
+            )
+
+            if existing.get("memories"):
+                for mem in existing["memories"]:
+                    score = mem.get("similarity_score", 0)
+                    if score >= MCP_MISTAKE_NOTE_DEDUP_THRESHOLD:
+                        # Increment failure_count on existing note
+                        content_hash = mem["content_hash"]
+                        old_meta = mem.get("metadata") or {}
+                        if isinstance(old_meta, str):
+                            old_meta = json.loads(old_meta) if old_meta else {}
+                        count = old_meta.get("failure_count", 1) + 1
+                        old_meta["failure_count"] = count
+
+                        await self.storage.update_memory_metadata(
+                            content_hash=content_hash,
+                            updates={"metadata": old_meta},
+                            preserve_timestamps=False,
+                        )
+                        return {
+                            "status": "updated",
+                            "content_hash": content_hash,
+                            "failure_count": count,
+                            "message": f"Existing mistake note updated (seen {count} times)",
+                        }
+
+            # No match — store new mistake note
+            result = await self.store_memory(
+                content=content,
+                tags="mistake-note,error-replay",
+                memory_type="mistake",
+                metadata={"failure_count": 1},
+            )
+
+            if not result.get("success"):
+                return {"status": "error", "message": f"Failed to store: {result}"}
+
+            content_hash = ""
+            if isinstance(result, dict):
+                mem = result.get("memory", {})
+                if isinstance(mem, dict):
+                    content_hash = mem.get("content_hash", "")
+                elif not content_hash:
+                    content_hash = result.get("content_hash", "")
+            return {
+                "status": "created",
+                "content_hash": content_hash,
+                "failure_count": 1,
+                "message": "New mistake note recorded",
+            }
+
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    async def mistake_note_search(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Search mistake notes by semantic similarity.
+
+        Args:
+            query: Search query (error message, context, or task description)
+            limit: Maximum number of results
+
+        Returns:
+            Dictionary with matching mistake notes
+        """
+        try:
+            result = await self.retrieve_memories(
+                query=query,
+                n_results=limit,
+                memory_type="mistake",
+            )
+
+            notes = []
+            for mem in result.get("memories", []):
+                meta = mem.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta) if meta else {}
+                notes.append({
+                    "content_hash": mem["content_hash"],
+                    "content": mem["content"],
+                    "similarity": mem.get("similarity_score", 0),
+                    "failure_count": meta.get("failure_count", 1),
+                    "updated_at": mem.get("updated_at"),
+                })
+
+            return {"notes": notes, "count": len(notes)}
+
+        except Exception as e:
+            return {"notes": [], "count": 0, "error": str(e)}

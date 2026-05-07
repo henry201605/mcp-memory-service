@@ -45,7 +45,7 @@ Before merging or releasing:
 
 MCP Memory Service is a semantic memory layer for AI applications, accessible via REST API and MCP transport. It provides persistent storage for 14+ AI clients including Claude Desktop, OpenCode, LangGraph, CrewAI, and any HTTP client. It uses vector embeddings for semantic search, supports multiple storage backends (SQLite-vec, Cloudflare, Hybrid), and includes advanced features like memory consolidation, quality scoring, and OAuth 2.1 team collaboration.
 
-**Current Version:** v10.40.3 - fix(claude-hooks): eliminate socket hang-up and raise hook timeout — 1,675 tests — see [CHANGELOG.md](CHANGELOG.md) for details
+**Current Version:** v10.51.0 - feat(plugins): live plugin hooks + dynamic type dropdowns + audit-log example (PRs #863, #864, #867, @filhocf) — ~1,838 tests — see [CHANGELOG.md](CHANGELOG.md) for details
 
 > **🎯 v10.0.0 Milestone**: This major release represents a complete API consolidation - 34 tools unified into 12 with enhanced capabilities. All deprecated tools continue working with warnings until v11.0. See `docs/MIGRATION.md` for migration guide.
 
@@ -54,6 +54,30 @@ MCP Memory Service is a semantic memory layer for AI applications, accessible vi
 ## Essential Commands
 
 ### Development Server
+
+**Recommended (lifecycle CLI):**
+```bash
+# Start HTTP server in background with PID tracking, logs, health check
+memory launch                              # Background (default)
+memory launch --foreground                 # Foreground (same as server --http)
+memory launch --storage-backend hybrid     # With specific backend
+memory launch --debug                      # With debug logging
+
+# Check if server is running
+memory info
+
+# Stop server
+memory stop
+
+# Restart (preserves --storage-backend and --debug from running server)
+memory restart
+
+# View logs
+memory logs
+memory logs -n 50
+```
+
+**Legacy shell scripts (still available, but CLI is preferred):**
 ```bash
 # MCP server (for Claude Desktop integration)
 python -m mcp_memory_service.server
@@ -64,13 +88,18 @@ python scripts/server/run_http_server.py
 # Both servers simultaneously
 ./start_all_servers.sh
 
-# Quick update after git pull (RECOMMENDED)
+# Quick update after git pull
 ./scripts/update_and_restart.sh
 ```
 
+> **Note:** The `memory launch/stop/restart/info/logs` CLI commands are the
+> preferred way to manage the server going forward. The shell scripts
+> (`start_all_servers.sh`, `update_and_restart.sh`) still work but may be
+> deprecated in a future release. For new deployments, use the CLI.
+
 ### Testing
 ```bash
-# Run all tests (968 tests total)
+# Run all tests (~1,780 tests total)
 pytest
 
 # Run specific test file
@@ -230,7 +259,7 @@ src/mcp_memory_service/
 
 ## Test Architecture
 
-### Structure (968 tests)
+### Structure (~1,780 tests)
 ```
 tests/
 ├── api/              # API layer tests (compact types, operations)
@@ -316,7 +345,7 @@ export MCP_MEMORY_SQLITE_PRAGMAS=journal_mode=WAL,busy_timeout=15000,cache_size=
 
 **Configuration Precedence:** Environment variables > .env file > Global Claude Config > defaults
 
-**Important:** After updating `.env`, always restart servers. Use `./scripts/update_and_restart.sh` for automated workflow.
+**Important:** After updating `.env`, always restart servers. Use `memory restart` (preferred CLI) or `./scripts/update_and_restart.sh` (legacy) for automated workflow.
 
 **CRITICAL:** `MCP_MEMORY_SQLITE_PRAGMAS` must include `journal_mode=WAL` for concurrent access. Omitting WAL disables concurrent reads/writes and causes "database is locked" errors when HTTP server and MCP server run simultaneously.
 
@@ -387,7 +416,8 @@ export MCP_EXTERNAL_EMBEDDING_API_KEY=sk-xxx  # Optional
 - [`.claude/directives/development-setup.md`](.claude/directives/development-setup.md) - Editable install
 - [`.claude/directives/pr-workflow.md`](.claude/directives/pr-workflow.md) - Pre-PR checks (MANDATORY)
 - [`.claude/directives/refactoring-checklist.md`](.claude/directives/refactoring-checklist.md) - Refactoring safety
-- [`.claude/directives/version-management.md`](.claude/directives/version-management.md) - Release workflow
+- [`.claude/directives/version-management.md`](.claude/directives/version-management.md) - Release workflow (HOW)
+- [`.claude/directives/release-cadence.md`](.claude/directives/release-cadence.md) - Release batching (WHEN)
 
 **Quick workflow:**
 1. `pip install -e .` - Install in editable mode
@@ -507,7 +537,7 @@ memory.memory_type or ''
 | Port mismatch (hooks timeout) | Verify same port in `~/.claude/hooks/config.json` and server (default: 8000) |
 | Schema validation errors after PR merge | Run `/mcp` in Claude Code to reconnect with new schema |
 | Database lock errors | Add `journal_mode=WAL` to `MCP_MEMORY_SQLITE_PRAGMAS` in `.env`, restart servers |
-| Tests failing after git pull | Run `./scripts/update_and_restart.sh` (installs deps, restarts server) |
+| Tests failing after git pull | Run `memory restart` or `./scripts/update_and_restart.sh` (installs deps, restarts server) |
 | MCP fails on every session (Windows) | Set `MCP_INIT_TIMEOUT=120` in your MCP server env config (issue #474) |
 | Cloudflare 401 on MCP server startup (hybrid mode) | Set `MCP_HYBRID_SYNC_OWNER=http` in `.env` — MCP server then uses SQLite-Vec only, no Cloudflare token needed in Claude Desktop config |
 | Cloudflare 403 / sync not running (IPv6) | Python prefers IPv6 but token IP allowlist may only have IPv4. Add your IPv6 /64 network to token's Client IP Address Filtering, or remove IP filtering entirely |
@@ -569,7 +599,13 @@ python scripts/validation/diagnose_backend_config.py          # Backend-specific
 - **CLAUDE.md** - Architecture changes, new patterns, development workflows
 - **README.md** - New features, installation changes, user-facing updates
 - **CHANGELOG.md** - Every version bump (use github-release-manager agent)
-- **docs/index.html** - Landing page: MINOR/MAJOR releases only (version badge, test count, features). Auto-deployed via GitHub Pages. Also re-publish to here.now (`--slug merry-realm-j835`)
+- **docs/index.html** - Landing page: MINOR/MAJOR releases only (version badge, test count, features). Auto-deployed via GitHub Pages. Also re-publish to here.now:
+  ```bash
+  mkdir -p /tmp/herenow-publish && \
+  cp docs/index.html docs/brain-icon.png /tmp/herenow-publish/ && \
+  ~/.agents/skills/here-now/scripts/publish.sh /tmp/herenow-publish --slug merry-realm-j835 && \
+  rm -rf /tmp/herenow-publish
+  ```
 - **Wiki** - Detailed guides, troubleshooting, tutorials
 
 ## Additional Resources
@@ -589,6 +625,24 @@ python scripts/validation/diagnose_backend_config.py          # Backend-specific
 4. ✅ Run `pytest` (verify tests pass)
 5. ✅ Read relevant directive files for your work area
 6. ✅ Make changes and run `bash scripts/pr/pre_pr_check.sh` before PR
+
+## Skill routing
+
+When the user's request matches an available skill, invoke it via the Skill tool. When in doubt, invoke the skill.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence

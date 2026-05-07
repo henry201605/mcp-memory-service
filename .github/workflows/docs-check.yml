@@ -7,18 +7,24 @@ on:
       - 'docs/**'
       - 'README.md'
       - '*.md'
+      - 'src/mcp_memory_service/_version.py'
+      - 'scripts/ci/check_*.sh'
+      - '.github/workflows/docs-check.yml'
   pull_request:
     branches: [main]
     paths:
       - 'docs/**'
       - 'README.md'
       - '*.md'
+      - 'src/mcp_memory_service/_version.py'
+      - 'scripts/ci/check_*.sh'
+      - '.github/workflows/docs-check.yml'
 
 jobs:
   link-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check markdown links
         uses: gaurav-nelson/github-action-markdown-link-check@v1
@@ -32,7 +38,27 @@ jobs:
   dead-ref-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check for dead references
         run: bash scripts/ci/check_dead_refs.sh
+
+  orphan-doc-check:
+    # Only meaningful on pull_request events — needs a base ref to diff against.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for orphan docs (no inbound links)
+        run: bash scripts/ci/check_orphan_docs.sh
+
+  version-drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for version drift on landing page
+        run: bash scripts/ci/check_versions.sh

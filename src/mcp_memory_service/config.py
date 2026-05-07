@@ -739,12 +739,16 @@ CONSOLIDATION_CONFIG = {
 }
 
 # Consolidation scheduling settings (for APScheduler integration)
+# All schedules default to 'disabled' so consolidation is opt-in. Users must
+# explicitly set MCP_SCHEDULE_* env vars to enable automatic runs (issue #808).
+# Recommended values when enabling: daily='02:00', weekly='SUN 03:00',
+# monthly='01 04:00'. See .env.example for full documentation.
 CONSOLIDATION_SCHEDULE = {
-    'daily': os.getenv('MCP_SCHEDULE_DAILY', '02:00'),      # 2 AM daily
-    'weekly': os.getenv('MCP_SCHEDULE_WEEKLY', 'SUN 03:00'), # 3 AM on Sundays
-    'monthly': os.getenv('MCP_SCHEDULE_MONTHLY', '01 04:00'), # 4 AM on 1st of month
-    'quarterly': os.getenv('MCP_SCHEDULE_QUARTERLY', 'disabled'), # Disabled by default
-    'yearly': os.getenv('MCP_SCHEDULE_YEARLY', 'disabled')        # Disabled by default
+    'daily': os.getenv('MCP_SCHEDULE_DAILY', 'disabled'),
+    'weekly': os.getenv('MCP_SCHEDULE_WEEKLY', 'disabled'),
+    'monthly': os.getenv('MCP_SCHEDULE_MONTHLY', 'disabled'),
+    'quarterly': os.getenv('MCP_SCHEDULE_QUARTERLY', 'disabled'),
+    'yearly': os.getenv('MCP_SCHEDULE_YEARLY', 'disabled')
 }
 
 logger.info(f"Consolidation enabled: {CONSOLIDATION_ENABLED}")
@@ -914,6 +918,11 @@ def validate_oauth_configuration() -> None:
     elif OAUTH_AUTHORIZATION_CODE_EXPIRE_MINUTES > 60:  # 1 hour
         warnings.append(f"OAuth authorization code expiry is longer than recommended: {OAUTH_AUTHORIZATION_CODE_EXPIRE_MINUTES} minutes")
 
+    if OAUTH_REFRESH_TOKEN_EXPIRE_DAYS <= 0:
+        errors.append(f"OAuth refresh token expiry must be positive: {OAUTH_REFRESH_TOKEN_EXPIRE_DAYS}")
+    elif OAUTH_REFRESH_TOKEN_EXPIRE_DAYS > 365:
+        warnings.append(f"OAuth refresh token expiry is very long: {OAUTH_REFRESH_TOKEN_EXPIRE_DAYS} days")
+
     # Validate security settings
     if "localhost" in OAUTH_ISSUER or "127.0.0.1" in OAUTH_ISSUER:
         if not os.getenv('MCP_OAUTH_ISSUER'):
@@ -970,6 +979,7 @@ OAUTH_ISSUER = os.getenv('MCP_OAUTH_ISSUER') or get_oauth_issuer()
 # OAuth token configuration
 OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES = safe_get_int_env('MCP_OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES', 60, min_value=1, max_value=1440)  # 1 minute to 24 hours
 OAUTH_AUTHORIZATION_CODE_EXPIRE_MINUTES = safe_get_int_env('MCP_OAUTH_AUTHORIZATION_CODE_EXPIRE_MINUTES', 10, min_value=1, max_value=60)  # 1 minute to 1 hour
+OAUTH_REFRESH_TOKEN_EXPIRE_DAYS = safe_get_int_env('MCP_OAUTH_REFRESH_TOKEN_EXPIRE_DAYS', 30, min_value=1, max_value=365)  # 1 day to 1 year
 
 # OAuth security configuration
 ALLOW_ANONYMOUS_ACCESS = safe_get_bool_env('MCP_ALLOW_ANONYMOUS_ACCESS', False)
@@ -1038,9 +1048,22 @@ if MCP_QUALITY_SYSTEM_ENABLED:
 # Enable hybrid BM25 + Vector search
 MCP_HYBRID_SEARCH_ENABLED = safe_get_bool_env('MCP_HYBRID_SEARCH_ENABLED', True)
 
+# Fusion method: 'weighted_average' (default, legacy) or 'rrf' (Reciprocal Rank Fusion)
+MCP_HYBRID_FUSION_METHOD = os.getenv('MCP_HYBRID_FUSION_METHOD', 'weighted_average').lower()
+if MCP_HYBRID_FUSION_METHOD not in ('weighted_average', 'rrf'):
+    logger.warning(f"Invalid fusion method: {MCP_HYBRID_FUSION_METHOD}. Using 'weighted_average'")
+    MCP_HYBRID_FUSION_METHOD = 'weighted_average'
+
+# RRF parameters (only used when fusion_method='rrf')
+MCP_HYBRID_RRF_K = safe_get_int_env('MCP_HYBRID_RRF_K', 60, min_value=1, max_value=1000)
+MCP_HYBRID_RRF_CONSENSUS_BOOST = float(os.getenv('MCP_HYBRID_RRF_CONSENSUS_BOOST', '0.1'))
+
 # Score fusion weights (must sum to 1.0)
 MCP_HYBRID_KEYWORD_WEIGHT = float(os.getenv('MCP_HYBRID_KEYWORD_WEIGHT', '0.3'))
 MCP_HYBRID_SEMANTIC_WEIGHT = float(os.getenv('MCP_HYBRID_SEMANTIC_WEIGHT', '0.7'))
+
+# Mistake Notes configuration
+MCP_MISTAKE_NOTE_DEDUP_THRESHOLD = max(0.0, min(1.0, float(os.getenv('MCP_MISTAKE_NOTE_DEDUP_THRESHOLD', '0.85'))))
 
 # Validate weights
 if not 0.0 <= MCP_HYBRID_KEYWORD_WEIGHT <= 1.0:
@@ -1060,8 +1083,10 @@ if abs(weight_sum - 1.0) > 0.01:
     MCP_HYBRID_SEMANTIC_WEIGHT /= total
 
 logger.info(f"Hybrid Search: enabled={MCP_HYBRID_SEARCH_ENABLED}, "
+            f"fusion={MCP_HYBRID_FUSION_METHOD}, "
             f"keyword_weight={MCP_HYBRID_KEYWORD_WEIGHT:.2f}, "
-            f"semantic_weight={MCP_HYBRID_SEMANTIC_WEIGHT:.2f}")
+            f"semantic_weight={MCP_HYBRID_SEMANTIC_WEIGHT:.2f}"
+            + (f", rrf_k={MCP_HYBRID_RRF_K}, consensus_boost={MCP_HYBRID_RRF_CONSENSUS_BOOST}" if MCP_HYBRID_FUSION_METHOD == 'rrf' else ''))
 
 # =============================================================================
 # End Hybrid Search Configuration
@@ -1167,6 +1192,22 @@ else:
 
 # =============================================================================
 # End Memory Type Ontology Configuration
+
+# =============================================================================
+# Maintenance Configuration (memory_quality action="maintain")
+# =============================================================================
+MAINTAIN_STALE_DAYS = safe_get_int_env('MCP_MAINTAIN_STALE_DAYS', 30, min_value=1, max_value=3650)
+# WARNING: auto_resolve=true enables automatic conflict resolution — memories above
+# the similarity threshold will be silently merged. Use with caution at scale.
+MAINTAIN_AUTO_RESOLVE = safe_get_bool_env('MCP_MAINTAIN_AUTO_RESOLVE', False)
+try:
+    MAINTAIN_AUTO_RESOLVE_THRESHOLD = float(os.getenv('MCP_MAINTAIN_AUTO_RESOLVE_THRESHOLD', '0.95'))
+except (ValueError, TypeError):
+    logger.error("Invalid value for MCP_MAINTAIN_AUTO_RESOLVE_THRESHOLD, using default 0.95")
+    MAINTAIN_AUTO_RESOLVE_THRESHOLD = 0.95
+# Two-signal guard: only auto-resolve when both memories share the same type
+# AND their age difference exceeds this threshold (prevents resolving recent updates)
+MAINTAIN_AUTO_RESOLVE_AGE_DAYS = safe_get_int_env('MCP_MAINTAIN_AUTO_RESOLVE_AGE_DAYS', 7, min_value=0, max_value=365)
 
 # =============================================================================
 # Configuration Validation
