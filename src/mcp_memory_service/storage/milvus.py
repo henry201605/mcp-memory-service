@@ -975,14 +975,14 @@ class MilvusMemoryStorage(MemoryStorage):
 
     # Cached graph storage instance for conflict operations. Avoids creating
     # a new MilvusClient + gRPC connection on every store() call.
-    _graph_storage_cache: Optional[Any] = None
+    # Initialized as None; set per-instance in _get_graph_storage().
 
     async def _get_graph_storage(self):
-        """Get or create a cached MilvusGraphStorage instance."""
+        """Get or create a cached MilvusGraphStorage instance for this storage."""
         from .milvus_graph import MilvusGraphStorage
 
-        if self._graph_storage_cache is not None:
-            return self._graph_storage_cache
+        if getattr(self, "_graph_storage", None) is not None:
+            return self._graph_storage
 
         graph = MilvusGraphStorage(
             uri=self.uri,
@@ -990,7 +990,7 @@ class MilvusMemoryStorage(MemoryStorage):
             collection_name=self.collection_name,
         )
         await graph.initialize()
-        self._graph_storage_cache = graph
+        self._graph_storage = graph
         return graph
 
     async def _detect_conflicts(
@@ -1400,22 +1400,7 @@ class MilvusMemoryStorage(MemoryStorage):
             )
 
             logger.info("Stored memory %s", memory.content_hash)
-
-            # --- Conflict detection (post-commit) ---
-            try:
-                conflict_infos = await self._detect_conflicts(
-                    memory.content_hash, memory.content, embedding
-                )
-                if conflict_infos:
-                    await self._record_conflicts(memory.content_hash, conflict_infos)
-                    conflict_msg = f" {len(conflict_infos)} conflict(s) detected."
-                else:
-                    conflict_msg = ""
-            except Exception as e:  # noqa: BLE001 — conflict detection is best-effort
-                logger.warning("Conflict detection failed (non-fatal): %s", e)
-                conflict_msg = ""
-
-            return True, f"Memory stored successfully{conflict_msg}"
+            return True, "Memory stored successfully"
 
         except Exception as exc:  # noqa: BLE001 — contract requires (bool, str) not a raise
             logger.error("Failed to store memory: %s\n%s", exc, traceback.format_exc())
@@ -1678,6 +1663,13 @@ class MilvusMemoryStorage(MemoryStorage):
         else:
             hits = await self._run_search(query_embedding, tag_filter, fetch_n)
         results = self._rank_and_trim(hits, query, n_results, min_confidence)
+
+        # Filter out superseded memories (matching sqlite_vec behavior)
+        if not include_superseded:
+            results = [
+                r for r in results
+                if not r.memory.metadata.get("superseded_by")
+            ]
 
         # Async update last_accessed for hit memories (non-blocking)
         if results:
