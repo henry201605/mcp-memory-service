@@ -975,23 +975,30 @@ class MilvusMemoryStorage(MemoryStorage):
 
     # Cached graph storage instance for conflict operations. Avoids creating
     # a new MilvusClient + gRPC connection on every store() call.
-    _graph_storage_cache: Optional[Any] = None
+    # Stored as an instance attribute (_graph_storage) via _get_graph_storage().
 
     async def _get_graph_storage(self):
-        """Get or create a cached MilvusGraphStorage instance."""
+        """Get or create a cached MilvusGraphStorage instance (thread-safe)."""
         from .milvus_graph import MilvusGraphStorage
 
-        if self._graph_storage_cache is not None:
-            return self._graph_storage_cache
+        # Fast path: already initialized
+        if getattr(self, "_graph_storage", None) is not None:
+            return self._graph_storage
 
-        graph = MilvusGraphStorage(
-            uri=self.uri,
-            token=self.token,
-            collection_name=self.collection_name,
-        )
-        await graph.initialize()
-        self._graph_storage_cache = graph
-        return graph
+        # Slow path: initialize under lock to prevent concurrent creation
+        async with self._write_lock:
+            # Double-check after acquiring lock
+            if getattr(self, "_graph_storage", None) is not None:
+                return self._graph_storage
+
+            graph = MilvusGraphStorage(
+                uri=self.uri,
+                token=self.token,
+                collection_name=self.collection_name,
+            )
+            await graph.initialize()
+            self._graph_storage = graph
+            return graph
 
     async def _detect_conflicts(
         self, new_hash: str, new_content: str, embedding: List[float]
@@ -1685,7 +1692,15 @@ class MilvusMemoryStorage(MemoryStorage):
             hits = await self._run_hybrid_search(query, query_embedding, tag_filter, fetch_n)
         else:
             hits = await self._run_search(query_embedding, tag_filter, fetch_n)
-        results = self._rank_and_trim(hits, query, n_results, min_confidence)
+
+        # Rank all hits, filter superseded before trimming to preserve result count
+        results = self._rank_and_trim(hits, query, len(hits), min_confidence)
+        if not include_superseded:
+            results = [
+                r for r in results
+                if not r.memory.metadata.get("superseded_by")
+            ]
+        results = results[:n_results]
 
         # Async update last_accessed for hit memories (non-blocking)
         if results:
