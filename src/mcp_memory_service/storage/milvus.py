@@ -1325,12 +1325,17 @@ class MilvusMemoryStorage(MemoryStorage):
     # -- Semantic dedup ------------------------------------------------------
 
     @staticmethod
-    def _cosine_similarity(a: List[float], b: List[float]) -> float:
-        """Compute cosine similarity between two vectors (pure Python)."""
+    def _cosine_similarity_with_norm(
+        a: List[float], b: List[float], norm_a: float
+    ) -> float:
+        """Compute cosine similarity given a pre-computed norm for vector *a*.
+
+        Pre-computing ``norm_a`` avoids redundant work when the same query
+        vector is compared against many candidates in a loop.
+        """
         dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-        if norm_a == 0 or norm_b == 0:
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0.0 or norm_b == 0.0:
             return 0.0
         return dot / (norm_a * norm_b)
 
@@ -1350,7 +1355,10 @@ class MilvusMemoryStorage(MemoryStorage):
         been sealed/indexed — see GitHub issue #938.
 
         The query fetches recent memories with their vectors, then computes
-        cosine similarity on the client side.
+        cosine similarity on the client side.  The limit is set high (200) to
+        reduce the chance of missing duplicates when many memories are stored
+        within the time window.  If the query itself fails, we log and allow
+        the store to proceed (no silent data loss).
         """
         if not self._ensure_initialized():
             return False, None
@@ -1362,16 +1370,20 @@ class MilvusMemoryStorage(MemoryStorage):
             logger.warning("Semantic dedup skipped — embedding failed: %s", exc)
             return False, None
 
+        # Pre-compute the query vector norm once for all comparisons.
+        norm_a = math.sqrt(sum(x * x for x in embedding))
+
         try:
             rows = await self._call_client(
                 "query",
                 collection_name=self.collection_name,
                 filter=f"created_at >= {cutoff}",
                 output_fields=["id", "vector", "created_at"],
-                limit=50,
+                limit=200,
                 consistency_level="Strong",
             )
         except Exception as exc:  # noqa: BLE001
+            # On failure, allow store to proceed — no silent data loss.
             logger.warning("Semantic dedup query failed: %s", exc)
             return False, None
 
@@ -1382,7 +1394,7 @@ class MilvusMemoryStorage(MemoryStorage):
             row_vec = row.get("vector")
             if not row_vec:
                 continue
-            similarity = self._cosine_similarity(embedding, row_vec)
+            similarity = self._cosine_similarity_with_norm(embedding, row_vec, norm_a)
             if similarity >= similarity_threshold:
                 return True, row.get("id")
         return False, None
