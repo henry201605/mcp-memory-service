@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Fixed
 
+- fix(milvus): support `mode="ranked"` and the `ranking_weights` parameter in the Milvus backend. The ranked search feature (v10.70.0, #1028) extended the `MemoryStorage.search_memories` base signature and the MCP tool handler now always forwards `ranking_weights=...`, but the Milvus override was never updated — so every `memory_search` call on a Milvus backend raised `TypeError: search_memories() got an unexpected keyword argument 'ranking_weights'`. The override now accepts `ranking_weights`, whitelists `ranked` mode, over-fetches 3× and applies the shared `apply_ranked_rerank` multi-signal reranker (semantic + time decay + access frequency + quality), keeping parity with the base/sqlite-vec implementation
 - fix(mistake-notes): reject empty/whitespace-only `correct_action` in `mistake_note_add` and `mistake_note_update`. JSON-schema `required` enforces presence, not non-emptiness, so a blank `correct_action` previously passed validation and stored a mistake note with an error pattern but no remediation. Both add and update now return a clear validation error instead (issue #1055, PR #1057, @Aigen-Protocol)
 
 ## [10.70.3] - 2026-05-29

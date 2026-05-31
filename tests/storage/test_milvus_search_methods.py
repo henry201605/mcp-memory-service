@@ -346,3 +346,117 @@ class TestSearchMemories:
         storage._initialized = False
         result = await storage.search_memories(query="test")
         assert "error" in result
+
+    # -- ranked mode (regression for ranking_weights kwarg, commit b4d2723a) --
+
+    @pytest.mark.asyncio
+    async def test_ranking_weights_kwarg_accepted(self):
+        """Passing ranking_weights must not raise TypeError.
+
+        Regression: base.search_memories grew a ranking_weights param in
+        b4d2723a (#1028) but the Milvus override was not updated, so the
+        handler's unconditional ranking_weights=... passthrough crashed every
+        Milvus search with 'unexpected keyword argument'.
+        """
+        storage = _make_storage()
+        storage._run_hybrid_search = AsyncMock(return_value=[
+            _make_hit(content_hash="h1", distance=0.9),
+        ])
+
+        # Even in semantic mode (handler always passes ranking_weights) this
+        # must succeed rather than TypeError.
+        result = await storage.search_memories(
+            query="test", mode="semantic", ranking_weights={"semantic": 0.5}
+        )
+
+        assert result["total"] == 1
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_ranked_mode_accepted(self):
+        """ranked mode is a valid mode and returns results."""
+        storage = _make_storage(has_bm25=True)
+        storage._run_hybrid_search = AsyncMock(return_value=[
+            _make_hit(content_hash="h1", distance=0.9),
+            _make_hit(content_hash="h2", distance=0.7),
+        ])
+
+        result = await storage.search_memories(query="test query", mode="ranked")
+
+        assert result["mode"] == "ranked"
+        assert "error" not in result
+        assert result["total"] == 2
+
+    @pytest.mark.asyncio
+    async def test_ranked_mode_applies_multi_signal_rerank(self):
+        """ranked mode invokes apply_ranked_rerank on the candidate pool."""
+        storage = _make_storage(has_bm25=True)
+        storage._run_hybrid_search = AsyncMock(return_value=[
+            _make_hit(content_hash="h1", distance=0.9),
+        ])
+
+        with patch(
+            "src.mcp_memory_service.reasoning.ranked_search.apply_ranked_rerank"
+        ) as mock_rerank:
+            mock_rerank.side_effect = lambda results, weights=None: results
+            result = await storage.search_memories(query="test", mode="ranked")
+
+        mock_rerank.assert_called_once()
+        assert result["total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_ranked_mode_requires_query(self):
+        """ranked mode without query returns an error."""
+        storage = _make_storage()
+        result = await storage.search_memories(query=None, mode="ranked")
+        assert "error" in result
+        assert result["total"] == 0
+
+    @pytest.mark.asyncio
+    async def test_ranked_mode_pushes_tag_filter_to_milvus(self):
+        """ranked mode still pushes tag/time filters server-side.
+
+        Milvus applies filters at search time (combined_filter), unlike the
+        base class which over-fetches then post-filters. This guards that
+        ranked mode does not bypass the filter expression.
+        """
+        storage = _make_storage(has_bm25=True)
+        storage._run_hybrid_search = AsyncMock(return_value=[
+            _make_hit(content_hash="h1", distance=0.9, tags=",python,"),
+        ])
+
+        result = await storage.search_memories(
+            query="test", mode="ranked", tags=["python"]
+        )
+
+        assert result["mode"] == "ranked"
+        assert "error" not in result
+        # filter expression (3rd positional arg) must carry the tag clause
+        call_args = storage._run_hybrid_search.call_args
+        filter_expr = call_args[0][2]
+        assert "like" in filter_expr.lower() or "tags" in filter_expr.lower()
+
+    @pytest.mark.asyncio
+    async def test_ranked_mode_over_fetches_3x(self):
+        """ranked mode over-fetches a larger candidate pool before reranking.
+
+        Mirrors quality_boost's 3x over-fetch so the multi-signal rerank has
+        enough candidates to reorder (fetch_limit = limit * 3).
+        """
+        storage = _make_storage(has_bm25=True)
+        storage._run_hybrid_search = AsyncMock(return_value=[])
+        # capture the fetch_n passed to _retrieve_fetch_limit
+        captured = {}
+        orig = storage._retrieve_fetch_limit
+
+        def _spy(fetch_limit, combined_filter):
+            captured["fetch_limit"] = fetch_limit
+            return orig(fetch_limit, combined_filter)
+
+        storage._retrieve_fetch_limit = _spy
+
+        await storage.search_memories(query="test", mode="ranked", limit=10)
+
+        assert captured["fetch_limit"] == 30  # 10 * 3
+
+

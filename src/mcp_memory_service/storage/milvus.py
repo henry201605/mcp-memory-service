@@ -2571,21 +2571,22 @@ class MilvusMemoryStorage(MemoryStorage):
         limit: int = 10,
         include_debug: bool = False,
         include_superseded: bool = False,
+        ranking_weights: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Unified memory search with Milvus-native filtering.
 
         Pushes time and tag filters into Milvus filter expressions for
         server-side filtering instead of Python-side post-filtering.
-        Supports all modes: semantic, exact, hybrid.
+        Supports all modes: semantic, exact, hybrid, ranked.
         """
         if not self._ensure_initialized():
             return {"memories": [], "total": 0, "query": query, "mode": mode,
                     "error": "Milvus storage not initialized"}
 
         # Validate inputs
-        if mode not in ("semantic", "exact", "hybrid"):
+        if mode not in ("semantic", "exact", "hybrid", "ranked"):
             return {"memories": [], "total": 0, "query": query, "mode": mode,
-                    "error": f"Invalid mode: {mode}"}
+                    "error": f"Invalid mode: {mode}. Must be 'semantic', 'exact', 'hybrid', or 'ranked'"}
         if not 0.0 <= quality_boost <= 1.0:
             return {"memories": [], "total": 0, "query": query, "mode": mode,
                     "error": f"Invalid quality_boost: {quality_boost}"}
@@ -2677,13 +2678,17 @@ class MilvusMemoryStorage(MemoryStorage):
                     else:
                         results = [r for r in results if any(t in r.memory.tags for t in tags)]
 
-        elif mode in ("semantic", "hybrid"):
+        elif mode in ("semantic", "hybrid", "ranked"):
+            if mode == "ranked" and not query:
+                return {"memories": [], "total": 0, "query": query, "mode": mode,
+                        "error": "query required for ranked mode"}
             if not query and not combined_filter:
                 return {"memories": [], "total": 0, "query": query, "mode": mode,
                         "error": "At least one filter required (query, time, or tags)"}
 
             if query:
-                fetch_limit = limit * 3 if quality_boost > 0 else limit
+                # ranked over-fetches like quality_boost, then multi-signal reranks
+                fetch_limit = limit * 3 if (quality_boost > 0 or mode == "ranked") else limit
                 query_embedding = self._embed_query(query)
                 if query_embedding is None:
                     return {"memories": [], "total": 0, "query": query, "mode": mode,
@@ -2709,6 +2714,12 @@ class MilvusMemoryStorage(MemoryStorage):
                             semantic_weight * orig + quality_boost * r.memory.quality_score
                         )
                     results.sort(key=lambda r: r.relevance_score, reverse=True)
+
+                # Apply multi-signal ranked reranking (time decay + access + quality)
+                if mode == "ranked" and results:
+                    from ..reasoning.ranked_search import apply_ranked_rerank, RankedSearchWeights
+                    weights = RankedSearchWeights.from_dict(ranking_weights)
+                    results = apply_ranked_rerank(results, weights=weights)
             else:
                 # Time/tag only — use Milvus query with filter
                 try:
